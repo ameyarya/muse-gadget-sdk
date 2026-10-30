@@ -141,6 +141,7 @@ static int s_full_reply_h;  /* the caption's height while it fills the screen */
 static const lv_font_t *s_band_font;   /* the caption's font in the two-line band */
 static bool s_full_reply;
 static bool s_caption_shown;
+static void set_full_font(void);
 #endif
 static lv_obj_t *s_state_lbl;
 static lv_obj_t *s_name_lbl;    /* this gadget's own name, to tell it from the next one */
@@ -559,10 +560,7 @@ static void set_caption_font(bool cjk)
 #if CONFIG_MUSE_SMALL_FULL_REPLY
     s_caption_cjk = cjk;
     if (s_full_reply) {
-        /* The reply keeps the screen. Only the caption font draws CJK, at any Text size. */
-        lv_obj_set_style_text_font(s_caption_lbl, cjk ? caption_font() : s_full_font, 0);
-        lv_obj_set_style_text_line_space(s_caption_lbl, cjk ? CJK_LINE_SPACE : CAPTION_LINE_SPACE, 0);
-        return;
+        return;   /* the reply keeps the screen: set_full_font() once its text is in */
     }
 #endif
     int lines = cjk ? s_cjk_lines : 2;
@@ -899,15 +897,31 @@ static void on_ring_draw(lv_event_t *e)
 }
 
 #if CONFIG_MUSE_SMALL_FULL_REPLY
-/* The full-screen reply's font: the Text size setting's, or the caption font
- * for a reply with CJK in it. */
+/* The full-screen reply's font, for the text the caption has now: the Text
+ * size setting's, or the caption font for a reply with CJK in it, the only one
+ * that draws CJK. Montserrat is proportional, so a page of capitals can wrap
+ * past the bottom of the screen; that page is shown in unscii-8 instead, whose
+ * fixed cell holds any Medium or Large page. */
 static void set_full_font(void)
 {
 #if CONFIG_MUSE_CJK_FONT
-    set_caption_font(s_caption_cjk);
-#else
-    lv_obj_set_style_text_font(s_caption_lbl, s_full_font, 0);
+    if (s_caption_cjk) {
+        lv_obj_set_style_text_font(s_caption_lbl, caption_font(), 0);
+        lv_obj_set_style_text_line_space(s_caption_lbl, CJK_LINE_SPACE, 0);
+        return;
+    }
 #endif
+    const lv_font_t *font = s_full_font;
+    if (font != &lv_font_unscii_8) {
+        lv_point_t size;
+        lv_text_get_size(&size, lv_label_get_text(s_caption_lbl), font, 0, CAPTION_LINE_SPACE, s_w - 6,
+                         LV_TEXT_FLAG_NONE);
+        if (size.y > s_full_reply_h - 4) {
+            font = &lv_font_unscii_8;
+        }
+    }
+    lv_obj_set_style_text_font(s_caption_lbl, font, 0);
+    lv_obj_set_style_text_line_space(s_caption_lbl, CAPTION_LINE_SPACE, 0);
 }
 
 /* Picks the reply font for the Text size setting and pages replies to fit it:
@@ -1730,6 +1744,11 @@ static void update_status(muse_mode_t mode, float now)
         }
 #endif
         lv_label_set_text(lbl, caption);
+#if CONFIG_MUSE_SMALL_FULL_REPLY
+        if (s_full_reply) {
+            set_full_font();
+        }
+#endif
         lv_obj_set_flag(lbl, LV_OBJ_FLAG_HIDDEN, !caption[0]);
         if (s_reply_lbl) {
             lv_obj_add_flag(answer >= 0 ? s_caption_lbl : s_reply_lbl, LV_OBJ_FLAG_HIDDEN);

@@ -14,13 +14,15 @@
 
 """Full-screen replies on small screens (CONFIG_MUSE_SMALL_FULL_REPLY): the
 caption keeps the screen for every page of a reply, with or without CJK, every
-line of a reply reaches the screen through the caption buffer, and the band
-comes back when the reply ends.
+line of a reply reaches the screen through the caption buffer, every page fits
+the screen in the font it's drawn in, and the band comes back when the reply
+ends.
 
 The layout functions are compiled from muse_ui.c unchanged, against a fake
-LVGL with LVGL's font metrics that records the caption label's geometry and
-font. Their pages go through the real pager, muse_chat_text.c, into a
-MUSE_CAPTION_MAX buffer as the voice task's."""
+LVGL with LVGL 9.5's font metrics (glyph advances of Montserrat 14 and 20 and
+unscii-8) that records the caption label's geometry and font and wraps text
+as a label does. Their pages go through the real pager, muse_chat_text.c, into
+a MUSE_CAPTION_MAX buffer as the voice task's."""
 
 from __future__ import annotations
 
@@ -62,18 +64,61 @@ bool muse_hatch_caption_at(const char *text, size_t at, char *out, size_t cap);
 #define TAG "muse_ui"
 #define ESP_LOGI(...) ((void)0)
 
-/* LVGL 9's line heights and unscii's cells. */
-typedef struct { int line_h, glyph_w; } lv_font_t;
-static const lv_font_t lv_font_unscii_8 = { 9, 8 };
-static const lv_font_t lv_font_unscii_16 = { 17, 16 };
-static const lv_font_t lv_font_montserrat_14 = { 16, 0 };
-static const lv_font_t lv_font_montserrat_20 = { 22, 0 };
-static const lv_font_t cjk_font = { 17, 16 };   /* unscii-16 with the CJK fallback */
+/* LVGL 9.5's line heights and glyph advances, ' ' to '~'. */
+static const unsigned char M14_W[95] = {4,4,6,10,9,12,10,3,5,5,6,8,3,5,3,5,9,5,8,8,9,8,9,8,9,9,3,3,8,8,8,8,15,10,11,10,12,9,9,11,11,4,7,10,8,13,11,12,10,12,10,9,8,11,10,16,9,9,9,5,5,5,8,7,8,8,10,8,10,9,5,10,10,4,4,9,4,15,10,9,10,10,6,7,6,10,8,13,8,8,7,5,4,5,8};
+static const unsigned char M20_W[95] = {5,5,8,14,12,17,14,4,7,7,8,12,5,8,5,7,13,7,12,11,13,12,12,12,13,12,5,5,12,12,12,11,21,15,15,14,17,13,13,15,16,6,10,14,12,19,16,17,14,17,15,12,12,16,14,23,13,13,13,7,7,7,12,10,12,12,14,11,14,12,7,14,14,6,6,12,6,21,14,13,14,14,8,10,8,14,11,18,11,11,10,7,6,7,12};
+typedef struct { int line_h, glyph_w; const unsigned char *adv; } lv_font_t;
+static const lv_font_t lv_font_unscii_8 = { 9, 8, NULL };
+static const lv_font_t lv_font_unscii_16 = { 17, 16, NULL };
+static const lv_font_t lv_font_montserrat_14 = { 16, 10, M14_W };
+static const lv_font_t lv_font_montserrat_20 = { 22, 14, M20_W };
+static const lv_font_t cjk_font = { 17, 16, NULL };   /* unscii-16 with the CJK fallback */
 static const lv_font_t *caption_font(void) { return &cjk_font; }
 static int lv_font_get_line_height(const lv_font_t *f) { return f->line_h; }
-static int lv_font_get_glyph_width(const lv_font_t *f, int c, int next) { (void)c; (void)next; return f->glyph_w; }
+static int advance(const lv_font_t *f, int c) { return f->adv && c >= ' ' && c <= '~' ? f->adv[c - ' '] : f->glyph_w; }
+static int lv_font_get_glyph_width(const lv_font_t *f, int c, int next) { (void)next; return advance(f, c); }
 
-typedef struct { int w, h, pad_hor, line_space, opa, long_mode, align, y; bool hidden; const lv_font_t *font; } lv_obj_t;
+/* Wraps as a label does: at spaces, and inside a word wider than the line. */
+typedef struct { int32_t x, y; } lv_point_t;
+enum { LV_TEXT_FLAG_NONE };
+static void lv_text_get_size(lv_point_t *size, const char *text, const lv_font_t *f, int32_t letter_space,
+                             int32_t line_space, int32_t max_w, int flag)
+{
+    (void)letter_space; (void)flag;
+    int rows = 1, x = 0, widest = 0;
+    for (const char *p = text; *p;) {
+        if (*p == '\n') {
+            rows++, x = 0, p++;
+            continue;
+        }
+        if (*p == ' ') {
+            x += advance(f, ' '), p++;
+            continue;
+        }
+        int w = 0;
+        const char *e = p;
+        while (*e && *e != ' ' && *e != '\n') {
+            w += advance(f, (unsigned char)*e++);
+        }
+        if (x && x + w > max_w) {
+            rows++, x = 0;
+        }
+        for (; p < e; p++) {
+            int g = advance(f, (unsigned char)*p);
+            if (x && x + g > max_w) {
+                rows++, x = 0;
+            }
+            x += g;
+            widest = x > widest ? x : widest;
+        }
+    }
+    size->x = widest;
+    size->y = rows * f->line_h + (rows - 1) * line_space;
+}
+
+typedef struct { int w, h, pad_hor, line_space, opa, long_mode, align, y; bool hidden; const lv_font_t *font; char text[512]; } lv_obj_t;
+static void lv_label_set_text(lv_obj_t *o, const char *t) { snprintf(o->text, sizeof(o->text), "%s", t); }
+static char *lv_label_get_text(lv_obj_t *o) { return o->text; }
 enum { LV_OPA_70 = 178, LV_OPA_COVER = 255 };
 enum { LV_LABEL_LONG_MODE_WRAP, LV_LABEL_LONG_MODE_DOTS };
 enum { LV_ALIGN_TOP_MID, LV_ALIGN_BOTTOM_MID };
@@ -177,6 +222,30 @@ static void cjk_reply(char *out, size_t cap)
     out[o] = '\0';
 }
 
+/* Pages through `text` as update_status shows them while the reply has the
+ * screen, and checks each page fits the screen in the font it's drawn in. A
+ * page of ordinary prose keeps the Text size font. */
+static int pages_fit(const char *what, const char *text, bool prose)
+{
+    static char page[MUSE_CAPTION_MAX];
+    int small = 0;
+    size_t len = strlen(text);
+    for (size_t at = 0; at < len; at += 7) {
+        if (!muse_hatch_caption_at(text, at, page, sizeof(page))) {
+            continue;
+        }
+        lv_label_set_text(s_caption_lbl, page);
+        set_full_font();
+        lv_point_t size;
+        lv_text_get_size(&size, page, caption_obj.font, 0, caption_obj.line_space, s_w - 6, LV_TEXT_FLAG_NONE);
+        CHECK(size.y <= s_full_reply_h - 4, "%s, size %d: a page %d px tall in a %d px screen", what, s_size, (int)size.y,
+              s_full_reply_h - 4);
+        CHECK(!prose || caption_obj.font == s_full_font, "%s, size %d: prose drawn at Small", what, s_size);
+        small += caption_obj.font != s_full_font;
+    }
+    return small;
+}
+
 static void full(const char *step)
 {
     CHECK(caption_obj.h == s_full_reply_h && caption_obj.w == s_w, "%s: caption is %dx%d, not the full screen %dx%d",
@@ -224,6 +293,37 @@ int main(int argc, char **argv)
     every_line_shown("CJK", text);
 #endif
 
+    /* Every page of a reply fits; a page of capitals falls back to Small. */
+#if CONFIG_MUSE_CJK_FONT
+    set_caption_font(false);
+#endif
+    set_full_reply(true);
+    for (s_size = MUSE_TEXT_LARGE; s_size >= MUSE_TEXT_MEDIUM; s_size--) {
+        apply_text_size();
+        static const char prose[] = "Sure, it should be mild in town today, with a light breeze this morning and some sun "
+                                    "later on. Bring a jacket for the walk home, as it gets cooler after six. ";
+        static const char caps[] = "IMPORTANT: MAINTENANCE WINDOW MOVED TO WEDNESDAY MORNING. WARNING: WATER MAIN "
+                                   "WORK NEAR MAPLE AVENUE WILL MEAN NO WATER FROM NOW UNTIL NOON. ";
+        snprintf(text, sizeof(text), "%s%s%s", prose, prose, prose);
+        pages_fit("prose", text, true);
+        snprintf(text, sizeof(text), "%s%s%s", caps, caps, caps);
+        pages_fit("capitals", text, false);
+        /* Whole lines of the widest capital: every line wraps again. */
+        size_t o = 0;
+        for (int i = 0; i < 40; i++) {
+            for (int c = 0; c < s_cols; c++) {
+                text[o++] = 'W';
+            }
+            text[o++] = ' ';
+        }
+        text[o] = '\0';
+        int small = pages_fit("lines of W", text, false);
+        CHECK(s_w != 135 || s_size != MUSE_TEXT_MEDIUM || small > 0, "lines of W on the StickS3 never fell back to Small");
+    }
+    s_size = MUSE_TEXT_MEDIUM;
+    apply_text_size();
+    set_full_reply(false);
+
     /* A reply: the first page, then the next ones as they come. */
 #if CONFIG_MUSE_CJK_FONT
     set_caption_font(false);
@@ -232,10 +332,15 @@ int main(int argc, char **argv)
     full("first page");
     CHECK(caption_obj.font == medium, "first page: not the Text size font");
 #if CONFIG_MUSE_CJK_FONT
+    /* update_status: the band's font for the caption, its text, then the full screen's font. */
     set_caption_font(false);
+    lv_label_set_text(s_caption_lbl, "The next page.");
+    set_full_font();
     full("next page");
     CHECK(caption_obj.font == medium, "next page: not the Text size font");
     set_caption_font(true);
+    lv_label_set_text(s_caption_lbl, "\xe4\xbb\x8a\xe5\xa4\xa9");
+    set_full_font();
     full("CJK page");
     CHECK(caption_obj.font == &cjk_font, "CJK page: not the caption font");
     s_size = MUSE_TEXT_LARGE;
@@ -260,7 +365,7 @@ int main(int argc, char **argv)
 
 def function(source: str, name: str) -> str:
     """One whole function definition from muse_ui.c, or "" if it isn't there."""
-    match = re.search(r"^static void " + name + r"\(", source, re.M)
+    match = re.search(r"^static void " + name + r"\([^;{]*\)\n\{", source, re.M)
     if not match:
         return ""
     start = match.start()
