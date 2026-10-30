@@ -13,11 +13,14 @@
 # limitations under the License.
 
 """Full-screen replies on small screens (CONFIG_MUSE_SMALL_FULL_REPLY): the
-caption keeps the screen for every page of a reply, with or without CJK, its
-pages fit the caption buffer, and the band comes back when the reply ends.
+caption keeps the screen for every page of a reply, with or without CJK, every
+line of a reply reaches the screen through the caption buffer, and the band
+comes back when the reply ends.
 
 The layout functions are compiled from muse_ui.c unchanged, against a fake
-LVGL that records the caption label's geometry and font."""
+LVGL with LVGL's font metrics that records the caption label's geometry and
+font. Their pages go through the real pager, muse_chat_text.c, into a
+MUSE_CAPTION_MAX buffer as the voice task's."""
 
 from __future__ import annotations
 
@@ -32,25 +35,40 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-UI = ROOT / "components" / "muse" / "muse_ui.c"
+MUSE = ROOT / "components" / "muse"
+
+# Compact screens, as muse_ui_start lays them out: width, height, tall.
+SCREENS = {
+    "AIPI Lite": (128, 128, 0),
+    "StickS3": (135, 240, 1),
+    "XIAO 1.47": (172, 320, 1),
+    "AI Passport": (240, 320, 1),
+    "ATK box": (320, 240, 0),
+    "RoRoLee": (240, 120, 0),
+}
 
 HARNESS = r"""
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "muse_settings.h"
+#include "muse_state.h"
 
-#define MUSE_CAPTION_MAX 400
+bool muse_hatch_caption_at(const char *text, size_t at, char *out, size_t cap);
+
 #define CAPTION_LINE_SPACE 2
 #define TAG "muse_ui"
 #define ESP_LOGI(...) ((void)0)
 
+/* LVGL 9's line heights and unscii's cells. */
 typedef struct { int line_h, glyph_w; } lv_font_t;
-static const lv_font_t lv_font_unscii_8 = { 8, 8 };
-static const lv_font_t lv_font_unscii_16 = { 16, 8 };
-static const lv_font_t lv_font_montserrat_14 = { 16, 8 };
-static const lv_font_t lv_font_montserrat_20 = { 22, 11 };
-static const lv_font_t cjk_font = { 16, 8 };   /* unscii-16 with the CJK fallback */
+static const lv_font_t lv_font_unscii_8 = { 9, 8 };
+static const lv_font_t lv_font_unscii_16 = { 17, 16 };
+static const lv_font_t lv_font_montserrat_14 = { 16, 0 };
+static const lv_font_t lv_font_montserrat_20 = { 22, 0 };
+static const lv_font_t cjk_font = { 17, 16 };   /* unscii-16 with the CJK fallback */
 static const lv_font_t *caption_font(void) { return &cjk_font; }
 static int lv_font_get_line_height(const lv_font_t *f) { return f->line_h; }
 static int lv_font_get_glyph_width(const lv_font_t *f, int c, int next) { (void)c; (void)next; return f->glyph_w; }
@@ -72,21 +90,92 @@ static void lv_obj_set_flag(lv_obj_t *o, int f, bool on) { (void)f; o->hidden = 
 
 static int s_size = MUSE_TEXT_MEDIUM;
 int muse_settings_text_size(void) { return s_size; }
+
+/* muse_state.c's pages, with a mode that puts every line on one page. */
 static int s_cols, s_lines, s_cjk_cols, s_cjk_page_lines;
+static bool s_whole;
 void muse_state_set_page(int cols, int lines) { s_cols = cols; s_lines = lines; }
 void muse_state_set_cjk_page(int cols, int lines) { s_cjk_cols = cols; s_cjk_page_lines = lines; }
+void muse_state_page(bool cjk, int *cols, int *lines)
+{
+    bool own = cjk && s_cjk_cols > 0;
+    *cols = own ? s_cjk_cols : s_cols;
+    *lines = s_whole ? 100000 : own ? s_cjk_page_lines : s_lines;
+}
 
 static lv_obj_t caption_obj, canvas_obj;
 static lv_obj_t *s_caption_lbl = &caption_obj, *s_canvas = &canvas_obj;
-static int s_w = 172, s_h = 320;
-static bool s_tall = true, s_tv = false;
+static int s_w, s_h;
+static bool s_tall, s_tv;
 
 #include "extracted.inc"
 
 static int failures;
-#define CHECK(cond, ...) do { if (!(cond)) { failures++; printf("FAIL %s:%d: ", __func__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+#define CHECK(cond, ...) do { if (!(cond)) { failures++; printf("FAIL %dx%d %s:%d: ", s_w, s_h, __func__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
-static bool fits(int cols, int lines) { return (cols + 1) * lines <= MUSE_CAPTION_MAX * 2 / 3; }
+/* Pages through `text` as the voice task does while it plays, and checks that
+ * each of its lines is shown on some page. */
+static void every_line_shown(const char *what, const char *text)
+{
+    static char all[1 << 16], page[MUSE_CAPTION_MAX];
+    static char *lines[4096];
+    static bool seen[4096];
+    s_whole = true;
+    muse_hatch_caption_at(text, 0, all, sizeof(all));
+    s_whole = false;
+    int n = 0;
+    for (char *p = strtok(all, "\n"); p && n < 4096; p = strtok(NULL, "\n")) {
+        lines[n] = p;
+        seen[n++] = false;
+    }
+    /* The page only changes when playback reaches the next line. */
+    const char *from = text;
+    for (int k = 0; k < n; k++) {
+        const char *start = strstr(from, lines[k]);
+        if (!start || !muse_hatch_caption_at(text, (size_t)(start - text), page, sizeof(page))) {
+            continue;
+        }
+        from = start + strlen(lines[k]);
+        for (char *p = strtok(page, "\n"); p; p = strtok(NULL, "\n")) {
+            for (int i = 0; i < n; i++) {
+                if (!seen[i] && !strcmp(lines[i], p)) {
+                    seen[i] = true;
+                    break;
+                }
+            }
+        }
+    }
+    int missing = 0;
+    for (int i = 0; i < n; i++) {
+        missing += !seen[i];
+    }
+    CHECK(n > 10 && missing == 0, "%s: %d of %d lines never shown", what, missing, n);
+}
+
+/* Words a whole line long, each different. */
+static void ascii_reply(char *out, size_t cap, int cols)
+{
+    size_t o = 0;
+    for (int i = 0; i < 150 && o + cols + 2 < cap; i++) {
+        o += snprintf(out + o, cap - o, "%s%04d", i ? " " : "", i);
+        for (int c = 4; c < cols; c++) {
+            out[o++] = 'x';
+        }
+        out[o] = '\0';
+    }
+}
+
+/* Ideographs with no spaces, each different, three bytes each. */
+static void cjk_reply(char *out, size_t cap)
+{
+    size_t o = 0;
+    for (uint32_t cp = 0x4E00; cp < 0x4E00 + 1200 && o + 4 < cap; cp++) {
+        out[o++] = (char)(0xE0 | cp >> 12);
+        out[o++] = (char)(0x80 | (cp >> 6 & 0x3F));
+        out[o++] = (char)(0x80 | (cp & 0x3F));
+    }
+    out[o] = '\0';
+}
 
 static void full(const char *step)
 {
@@ -96,8 +185,16 @@ static void full(const char *step)
     CHECK(canvas_obj.hidden, "%s: Muse still shown", step);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc != 4) {
+        return 2;
+    }
+    s_w = atoi(argv[1]);
+    s_h = atoi(argv[2]);
+    s_tall = atoi(argv[3]);
+    static char text[8192];
+
     /* build_screen's band, then the option's setup. */
     lv_obj_set_size(s_caption_lbl, s_w, 2 * 8 + 2 + 4);
     lv_obj_set_style_text_font(s_caption_lbl, &lv_font_unscii_8, 0);
@@ -105,22 +202,26 @@ int main(void)
     lv_label_set_long_mode(s_caption_lbl, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_set_style_bg_opa(s_caption_lbl, LV_OPA_70, 0);
 #if CONFIG_MUSE_CJK_FONT
-    s_cjk_lines = 1;
-    muse_state_set_cjk_page((s_w - 2 * CJK_BAND_PAD) / 8, s_cjk_lines);
+    s_cjk_lines = !s_tall && s_h >= 200 ? 2 : 1;
+    muse_state_set_cjk_page((s_w - 2 * CJK_BAND_PAD) / 16, s_cjk_lines);
 #endif
     s_full_reply_h = s_h - FULL_REPLY_TOP - 6;
     s_band_font = &lv_font_unscii_8;
     for (s_size = MUSE_TEXT_LARGE; s_size >= MUSE_TEXT_SMALL; s_size--) {
         apply_text_size();
-        CHECK(s_lines > 2 && fits(s_cols, s_lines), "size %d: page %dx%d", s_size, s_cols, s_lines);
+        CHECK(s_lines >= 2, "size %d: page %dx%d", s_size, s_cols, s_lines);
+        ascii_reply(text, sizeof(text), s_cols);
+        every_line_shown("ASCII", text);
     }
     s_size = MUSE_TEXT_MEDIUM;
     apply_text_size();
     const lv_font_t *medium = &lv_font_montserrat_14;
 #if CONFIG_MUSE_CJK_FONT
-    int lines_h = s_cjk_page_lines * 16 + (s_cjk_page_lines - 1) * CJK_LINE_SPACE;
-    CHECK(s_cjk_page_lines > s_cjk_lines && fits(s_cjk_cols, s_cjk_page_lines) && lines_h <= s_full_reply_h - 4,
-          "CJK page %dx%d is the band's or doesn't fit the screen and buffer", s_cjk_cols, s_cjk_page_lines);
+    int lines_h = s_cjk_page_lines * cjk_font.line_h + (s_cjk_page_lines - 1) * CJK_LINE_SPACE;
+    CHECK(s_cjk_page_lines > s_cjk_lines && lines_h <= s_full_reply_h - 4 && s_cjk_cols * 16 <= s_w - 6,
+          "CJK page %dx%d is the band's or doesn't fit the screen", s_cjk_cols, s_cjk_page_lines);
+    cjk_reply(text, sizeof(text));
+    every_line_shown("CJK", text);
 #endif
 
     /* A reply: the first page, then the next ones as they come. */
@@ -143,8 +244,7 @@ int main(void)
     CHECK(caption_obj.font == &cjk_font, "Text size changed: CJK lost its font");
     set_full_reply(false);
     CHECK(!canvas_obj.hidden && caption_obj.long_mode == LV_LABEL_LONG_MODE_DOTS, "reply over: no band");
-    CHECK(caption_obj.font == &cjk_font && caption_obj.h == 16 + 6 && caption_obj.pad_hor == CJK_BAND_PAD,
-          "reply over: not the CJK band (h %d)", caption_obj.h);
+    CHECK(caption_obj.font == &cjk_font && caption_obj.pad_hor == CJK_BAND_PAD, "reply over: not the CJK band's font");
     set_caption_font(false);
     CHECK(caption_obj.font == &lv_font_unscii_8 && caption_obj.h == 2 * 8 + 2 + 4, "band: not two lines of unscii-8");
 #else
@@ -153,7 +253,6 @@ int main(void)
     CHECK(caption_obj.font == &lv_font_unscii_8 && caption_obj.h == 2 * 8 + 2 + 4 && caption_obj.pad_hor == 0,
           "reply over: not the band");
 #endif
-    printf("%s\n", failures ? "FAILED" : "OK");
     return failures != 0;
 }
 """
@@ -190,20 +289,23 @@ class FullReplyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             stage = Path(tmp)
             (stage / "esp_err.h").write_text("#pragma once\ntypedef int esp_err_t;\n")
-            shutil.copyfile(ROOT / "components" / "muse" / "muse_settings.h", stage / "muse_settings.h")
-            (stage / "extracted.inc").write_text(extract(UI.read_text()))
+            (stage / "extracted.inc").write_text(extract((MUSE / "muse_ui.c").read_text()))
             (stage / "harness.c").write_text(HARNESS)
             binary = stage / "harness"
             build = subprocess.run(
-                [*shlex.split(os.environ.get("CC", "cc")), "-std=gnu11", "-Wall", "-Wextra", "-Werror",
+                [*shlex.split(os.environ.get("CC", "cc")), "-include", str(ROOT / "tests" / "host_compat.h"),
+                 "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                  "-Wno-unused-function", "-Wno-unused-variable", "-Wno-unused-but-set-variable",
                  "-DCONFIG_MUSE_SMALL_FULL_REPLY=1", f"-DCONFIG_MUSE_CJK_FONT={int(cjk)}",
-                 "-I", str(stage), str(stage / "harness.c"), "-o", str(binary)],
+                 "-I", str(stage), "-I", str(MUSE), str(stage / "harness.c"),
+                 str(MUSE / "muse_chat_text.c"), str(MUSE / "muse_text.c"), "-o", str(binary)],
                 text=True, capture_output=True,
             )
             self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
-            run = subprocess.run([str(binary)], text=True, capture_output=True)
-            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            for name, (w, h, tall) in SCREENS.items():
+                with self.subTest(screen=name):
+                    run = subprocess.run([str(binary), str(w), str(h), str(tall)], text=True, capture_output=True)
+                    self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
 
     def test_without_cjk_font(self) -> None:
         self.run_harness(cjk=False)

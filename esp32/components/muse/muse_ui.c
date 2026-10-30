@@ -936,10 +936,11 @@ static void apply_text_size(void)
     }
     muse_state_set_page(cols, lines);
 #if CONFIG_MUSE_CJK_FONT
-    /* Replies with CJK fill the screen too, in the 16 px caption font. */
+    /* Replies with CJK fill the screen too, in the 16 px caption font. A CJK
+     * character takes one column and three bytes of the caption. */
     int cjk_cols = (s_w - 6) / lv_font_get_glyph_width(caption_font(), 'M', ' ');
     int cjk_lines = (s_full_reply_h - 4 + CJK_LINE_SPACE) / (lv_font_get_line_height(caption_font()) + CJK_LINE_SPACE);
-    while ((cjk_cols + 1) * cjk_lines > MUSE_CAPTION_MAX * 2 / 3) {
+    while ((3 * cjk_cols + 1) * cjk_lines > MUSE_CAPTION_MAX - 1) {
         cjk_lines--;
     }
     muse_state_set_cjk_page(cjk_cols, cjk_lines);
