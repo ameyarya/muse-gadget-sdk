@@ -548,11 +548,23 @@ static const lv_font_t *caption_font(void)
 #define CJK_BAND_PAD 6          /* px each side of a CJK caption on a small screen */
 #define CJK_LINE_SPACE 4
 static int s_cjk_lines;         /* lines of CJK the small screen's caption band holds */
+#if CONFIG_MUSE_SMALL_FULL_REPLY
+static bool s_caption_cjk;      /* the caption shown has CJK in it */
+#endif
 
 /* The small screen's band: two lines of unscii-8, or s_cjk_lines of the 16 px
  * caption font with room between them. */
 static void set_caption_font(bool cjk)
 {
+#if CONFIG_MUSE_SMALL_FULL_REPLY
+    s_caption_cjk = cjk;
+    if (s_full_reply) {
+        /* The reply keeps the screen. Only the caption font draws CJK, at any Text size. */
+        lv_obj_set_style_text_font(s_caption_lbl, cjk ? caption_font() : s_full_font, 0);
+        lv_obj_set_style_text_line_space(s_caption_lbl, cjk ? CJK_LINE_SPACE : CAPTION_LINE_SPACE, 0);
+        return;
+    }
+#endif
     int lines = cjk ? s_cjk_lines : 2;
     int line_h = cjk ? lv_font_get_line_height(caption_font()) : 8;
     int space = cjk && lines > 1 ? CJK_LINE_SPACE : 2;
@@ -887,6 +899,17 @@ static void on_ring_draw(lv_event_t *e)
 }
 
 #if CONFIG_MUSE_SMALL_FULL_REPLY
+/* The full-screen reply's font: the Text size setting's, or the caption font
+ * for a reply with CJK in it. */
+static void set_full_font(void)
+{
+#if CONFIG_MUSE_CJK_FONT
+    set_caption_font(s_caption_cjk);
+#else
+    lv_obj_set_style_text_font(s_caption_lbl, s_full_font, 0);
+#endif
+}
+
 /* Picks the reply font for the Text size setting and pages replies to fit it:
  * unscii-8's fixed cell (the band's font), or Montserrat 14 or 20. Montserrat
  * is proportional, so pages are cut for an average character, with a line
@@ -912,8 +935,17 @@ static void apply_text_size(void)
         lines--;
     }
     muse_state_set_page(cols, lines);
+#if CONFIG_MUSE_CJK_FONT
+    /* Replies with CJK fill the screen too, in the 16 px caption font. */
+    int cjk_cols = (s_w - 6) / lv_font_get_glyph_width(caption_font(), 'M', ' ');
+    int cjk_lines = (s_full_reply_h - 4 + CJK_LINE_SPACE) / (lv_font_get_line_height(caption_font()) + CJK_LINE_SPACE);
+    while ((cjk_cols + 1) * cjk_lines > MUSE_CAPTION_MAX * 2 / 3) {
+        cjk_lines--;
+    }
+    muse_state_set_cjk_page(cjk_cols, cjk_lines);
+#endif
     if (s_full_reply) {
-        lv_obj_set_style_text_font(s_caption_lbl, s_full_font, 0);
+        set_full_font();
     }
     ESP_LOGI(TAG, "full-screen reply pages: %d x %d", cols, lines);
 }
@@ -1565,18 +1597,22 @@ static void set_full_reply(bool on)
     lv_obj_set_flag(s_canvas, LV_OBJ_FLAG_HIDDEN, on);
     if (on) {
         lv_obj_set_size(s_caption_lbl, s_w, s_full_reply_h);
-        lv_obj_set_style_text_font(s_caption_lbl, s_full_font, 0);
         lv_obj_set_style_pad_hor(s_caption_lbl, 3, 0);
         lv_obj_set_style_bg_opa(s_caption_lbl, LV_OPA_COVER, 0);
         lv_label_set_long_mode(s_caption_lbl, LV_LABEL_LONG_MODE_WRAP);
         lv_obj_align(s_caption_lbl, LV_ALIGN_TOP_MID, 0, FULL_REPLY_TOP);
+        set_full_font();
     } else {
         lv_obj_set_size(s_caption_lbl, s_w, 2 * 8 + 2 + 4);
-        lv_obj_set_style_text_font(s_caption_lbl, s_band_font, 0);
-        lv_obj_set_style_pad_hor(s_caption_lbl, 0, 0);
         lv_obj_set_style_bg_opa(s_caption_lbl, LV_OPA_70, 0);
         lv_label_set_long_mode(s_caption_lbl, LV_LABEL_LONG_MODE_DOTS);
         lv_obj_align(s_caption_lbl, LV_ALIGN_BOTTOM_MID, 0, (s_tall || s_tv) ? -30 : -3);
+#if CONFIG_MUSE_CJK_FONT
+        set_caption_font(s_caption_cjk);   /* the band's font, padding and height */
+#else
+        lv_obj_set_style_text_font(s_caption_lbl, s_band_font, 0);
+        lv_obj_set_style_pad_hor(s_caption_lbl, 0, 0);
+#endif
     }
 }
 #endif

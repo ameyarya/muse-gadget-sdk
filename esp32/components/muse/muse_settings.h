@@ -25,7 +25,8 @@
 /*
  * User settings, persisted in NVS. Setters save immediately and then notify the
  * change listener (from the caller's task), which applies the setting to the
- * hardware. Brightness, auto-sleep and the speaker are polled where they're used.
+ * hardware. Brightness, auto-sleep and the speaker are polled where they're used,
+ * as is the reply text size, which notifies nothing.
  */
 
 #define MUSE_SSID_MAX 32
